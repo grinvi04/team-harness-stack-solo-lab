@@ -1,0 +1,104 @@
+# test-guard — PR에서 테스트가 (소리없이) 삭제되는 것을 차단하는 기계 게이트.
+# 배경: harness-guard 훅은 Bash 커맨드만 검사하고(Edit/Write로 테스트 삭제 못 잡음),
+# CI는 테스트가 삭제되면 그냥 green이라 못 잡는다. 이 게이트가 그 공백을 메운다.
+# 정당한 제거(데드코드 정리 등)는 PR에 'allow-test-removal' 라벨을 붙이면 통과.
+#
+# 스택 무관: 흔한 테스트 마커를 repo 전역에서 센다(@Test / it()·test() / def test_ / rspec it).
+# 필요 시 프로젝트가 count() 정규식을 스택에 맞게 좁혀도 된다.
+# 이 gate는 줄 수만 비교하며 테스트를 실행하지 않으므로 의미 보존이나 실패 실행을 보장하지 않는다.
+# 셋업: new-repo.sh가 이 파일을 복사하고 'test-guard'를 required check에 등록한다.
+name: test-guard
+
+on:
+  pull_request_target:
+    branches: [main, develop]
+    types: [opened, synchronize, reopened, edited, stacked, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+jobs:
+  test-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record trusted source provenance
+        env:
+          WORKFLOW_SHA: ${{ github.workflow_sha }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+        run: node scripts/stack-provenance.mjs
+
+      - name: Detect test removals
+        env:
+          BASE: ${{ github.event.pull_request.stack.base.ref || github.event.pull_request.base.ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          READ_TOKEN: ${{ github.token }}
+          LABELS: ${{ toJson(github.event.pull_request.labels.*.name) }}
+        run: |
+          set -euo pipefail
+
+          HAS_EXEMPTION=$(node -e '
+            const labels = JSON.parse(process.env.LABELS);
+            if (!Array.isArray(labels) || labels.some(x => typeof x !== "string")) process.exit(1);
+            console.log(labels.includes("allow-test-removal"));
+          ') || { echo "::error::잘못된 label metadata입니다."; exit 1; }
+          if [ "$HAS_EXEMPTION" = true ]; then
+            echo "::notice::'allow-test-removal' 라벨 — 테스트 감소 허용(게이트 스킵)"
+            exit 0
+          fi
+
+          if ! [[ "$BASE" = main || "$BASE" = develop ]] || ! [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ && "$BASE_SHA" =~ ^[0-9a-f]{40}$ && "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::잘못된 PR 비교 metadata입니다."; exit 1
+          fi
+          FETCH_AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$READ_TOKEN" | base64 | tr -d '\n')"
+          unset READ_TOKEN
+          fetch_objects() {
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraheader GIT_CONFIG_VALUE_0="$FETCH_AUTH" \
+              git fetch --quiet --no-tags origin "$@"
+          }
+          fetch_objects "refs/pull/$PR_NUMBER/head"
+          if [ "$(git rev-parse FETCH_HEAD)" != "$HEAD_SHA" ]; then
+            echo "::error::PR head가 변경되었습니다. 최신 이벤트가 필요합니다."; exit 1
+          fi
+          fetch_objects "$BASE_SHA"
+          unset FETCH_AUTH
+
+          # 테스트·실행 단언 줄 총개수(스택 무관): JUnit @Test / JS·TS it()·test() / pytest def test_
+          # / rspec·minitest 블록 DSL(it/describe/context/test '...' do — 괄호 없이 공백+따옴표)
+          # / 이 repo shell 테스트의 check "..."·case_ "..." 호출 형태
+          # rspec/minitest 대안은 줄-시작 앵커(^[[:space:]]*)로 산문 오탐 차단 — 예제는 항상 들여쓰기 후 줄 시작,
+          # 산문의 the feature "x"·we test "y" 같은 문중 매칭을 배제(전역 git grep이라 오탐이 삭제를 상쇄하는 것 방지).
+          MARKER='@Test|(^|[^A-Za-z_])(it|test)[[:space:]]*\(|def[[:space:]]+test_|^[[:space:]]*(it|describe|context|specify|scenario|feature|test)[[:space:]]+["'"'"']|^[[:space:]]*(check|case_)[[:space:]]+'
+          count() {
+            local matches rc
+            if matches=$(git grep -hIE "$MARKER" "$1" 2>/dev/null); then
+              printf '%s\n' "$matches" | grep -cE "$MARKER"
+            else
+              rc=$?
+              if [ "$rc" -eq 1 ]; then echo 0; else return "$rc"; fi
+            fi
+          }
+
+          if ! BEFORE=$(count "$BASE_SHA"); then
+            echo "::error::기준 브랜치 테스트 단언 수를 확인할 수 없습니다."; exit 1
+          fi
+          if ! AFTER=$(count "$HEAD_SHA"); then
+            echo "::error::PR 테스트 단언 수를 확인할 수 없습니다."; exit 1
+          fi
+          echo "테스트 마커 — base($BASE)=$BEFORE, PR(head)=$AFTER"
+
+          if [ "$BEFORE" -gt 0 ] && [ "$AFTER" -eq 0 ]; then
+            echo "::error::기준의 테스트 단언 전체가 사라졌습니다."; exit 1
+          fi
+          if [ "$AFTER" -lt "$BEFORE" ]; then
+            echo "::error::테스트가 $((BEFORE - AFTER))개 감소했습니다. 의도된 제거라면 PR에 'allow-test-removal' 라벨을 붙이세요."
+            exit 1
+          fi
+          echo "✅ 테스트 감소 없음"

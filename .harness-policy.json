@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "mode": "solo",
+  "autoMergeTargets": [],
+  "branchFlow": "git-flow",
+  "stackedPRs": {
+    "enabled": true,
+    "provider": "github-gh-stack"
+  }
+}

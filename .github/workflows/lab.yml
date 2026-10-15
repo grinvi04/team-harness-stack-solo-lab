@@ -1,0 +1,31 @@
+name: synthetic-ci-cd
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Synthetic pending-window probe
+        run: if [ -f test-delay.signal ]; then sleep 90; fi
+      - run: node --test
+      - run: node scripts/build.mjs
+  deploy-smoke:
+    needs: quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - run: node scripts/build.mjs
+      - run: node scripts/deploy-smoke.mjs

@@ -1,0 +1,11 @@
+{
+  "name": "synthetic-acceptance-lab",
+  "private": true,
+  "type": "module",
+  "version": "0.2.2",
+  "scripts": {
+    "test": "node --test",
+    "build": "node scripts/build.mjs",
+    "deploy-smoke": "node scripts/deploy-smoke.mjs"
+  }
+}
